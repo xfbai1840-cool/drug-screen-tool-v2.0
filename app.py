@@ -202,4 +202,86 @@ if uploaded_file is not None:
                 st.info("🔄 正在解析并匹配化合物库信息...")
                 df_lib = load_mce_library(uploaded_lib, uploaded_lib.name)
                 
-                if df_lib is not None and "Plate" in df_lib.columns and
+                # 使用括号安全换行，防止再次出现 SyntaxError
+                if (df_lib is not None and 
+                    "Plate" in df_lib.columns and 
+                    "Well" in df_lib.columns):
+                    
+                    # 标准化 MCE 的板号和孔位
+                    df_lib["Physical_Plate"] = df_lib["Plate"].astype(str).str.extract(r'(\d+)')[0]
+                    df_lib["Physical_Well"] = df_lib["Well"].apply(format_well)
+                    
+                    # 进行合并
+                    df_res = pd.merge(df_res, df_lib, on=["Physical_Plate", "Physical_Well"], how="left")
+                    st.success("✅ 化合物库匹配成功！化合物名称已添加到结果中。")
+                else:
+                    st.warning("⚠️ 无法在上传的库文件中自动识别 'Plate' 和 'Well' 列，请检查文件格式。")
+
+            # 1. 统计信息
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("总扫描孔数", global_drug_count)
+            col2.metric("毒性/假阳性剔除", total_tox_drop)
+            col3.metric("异常极高信号剔除", total_high_drop)
+            col4.metric("有效数据量", len(df_res))
+            
+            st.divider()
+            
+            # 2. 绘图
+            st.subheader("📊 筛选结果可视化")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.scatter(df_res["Global_ID"], df_res["Ratio"], c='#5cb85c', s=15, alpha=0.6, label='Candidates')
+            
+            hits_df = df_res[df_res["Is_Hit"] == "Yes"]
+            if not hits_df.empty:
+                ax.scatter(hits_df["Global_ID"], hits_df["Ratio"], c='red', s=40, label=f'Hits (≥ {THRESHOLD_HIT})')
+                
+            ax.axhline(1.0, color='black', linestyle='--', label='Plate Control (1.0)')
+            ax.axhline(THRESHOLD_HIT, color='blue', linestyle=':', label=f'Hit Threshold ({THRESHOLD_HIT})')
+            ax.set_xlabel('Global Drug Sequence')
+            ax.set_ylabel('Normalized Ratio')
+            
+            y_max = df_res["Ratio"].max()
+            ax.set_ylim(bottom=-0.1, top=max(y_max * 1.1, THRESHOLD_HIT * 1.5))
+            ax.legend()
+            ax.grid(True, linestyle=':', alpha=0.4)
+            st.pyplot(fig)
+            
+            # 3. Hits 下载
+            st.divider()
+            st.subheader("🎉 强效升高信号药 (Hits) 列表")
+            
+            if not hits_df.empty:
+                st.write(f"发现 **{len(hits_df)}** 个 Hits (Ratio ≥ {THRESHOLD_HIT})")
+                
+                # 动态选择要展示的列（如果有上传化合物库，把关键信息排在前面）
+                base_cols = ["Plate_ID", "Physical_Well", "Ratio", "Raw_RFU", "Coordinate"]
+                lib_cols = [c for c in ["Product Name", "Catalog Number", "Target", "Pathway"] if c in df_res.columns]
+                display_cols = lib_cols + base_cols
+                
+                # 按照 Ratio 降序排列
+                hits_display = hits_df.sort_values(by="Ratio", ascending=False)
+                final_cols = [c for c in display_cols if c in hits_display.columns]
+                
+                st.dataframe(hits_display[final_cols].head(10))
+                
+                # 导出Excel，包含所有详细信息
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    # 导出全部字段以防万一
+                    export_cols = final_cols + [c for c in hits_display.columns if c not in final_cols and c not in ["Physical_Plate", "Is_Hit"]]
+                    hits_display[export_cols].to_excel(writer, index=False, sheet_name='Hits')
+                
+                st.download_button(
+                    label="📥 下载带有化合物信息的 Hits 列表 (Excel)",
+                    data=buffer.getvalue(),
+                    file_name="Enhancer_Hits_with_Info.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
+            else:
+                st.warning("本次筛选未发现符合条件的 Hits。")
+                
+        else:
+            st.error("分析完成，但没有有效数据（可能全部被剔除或格式错误）。")
+            
+    except Exception as e:
+        st.error(f"文件读取或分析出错: {e}")
