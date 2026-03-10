@@ -55,9 +55,13 @@ def get_col_letter(col_idx):
     return f"C{col_idx}"
 
 def format_well(w):
-    """ 暴力清洗孔位：删掉空格、Tab、换行符 """
+    """ 
+    【终极暴力清洗孔位】
+    只要不是英文字母(a-z, A-Z)和数字(0-9)，其余不管是退格键、空格、换行还是希腊字母，统统删掉！
+    """
     w = str(w)
-    w = re.sub(r'[\s\t\n\r\ufeff]+', '', w)
+    # [^a-zA-Z0-9] 匹配所有非字母数字字符
+    w = re.sub(r'[^a-zA-Z0-9]', '', w)
     if len(w) >= 2 and w[0].isalpha() and w[1:].isdigit():
         return f"{w[0].upper()}{int(w[1:]):02d}"
     return w
@@ -65,10 +69,8 @@ def format_well(w):
 def load_mce_library(file_obj, filename):
     """ 专门针对 MCE Excel 文件的超级解析器 """
     try:
-        # 1. 读取 Excel
         df = pd.read_excel(file_obj)
         
-        # 2. 寻找真实表头
         header_idx = -1
         for i in range(min(30, len(df))):
             row_str = " ".join(df.iloc[i].fillna("").astype(str)).lower()
@@ -77,13 +79,13 @@ def load_mce_library(file_obj, filename):
                 break
                 
         if header_idx != -1:
-            df.columns = df.iloc[header_idx].astype(str).str.strip().str.replace('\ufeff', '')
+            # 清洗列名中的非打印字符
+            df.columns = [re.sub(r'[\x00-\x1F\x7F\ufeff]', '', str(c)).strip() for c in df.iloc[header_idx]]
             df = df.iloc[header_idx+1:].reset_index(drop=True)
         else:
             st.warning("⚠️ 无法在 Excel 中找到 Plate 和 Well 表头。")
             return None
             
-        # 3. 规范化列名
         col_map = {}
         for c in df.columns:
             cl = c.lower().strip()
@@ -94,18 +96,16 @@ def load_mce_library(file_obj, filename):
             elif 'target' in cl: col_map[c] = 'Target'
         df.rename(columns=col_map, inplace=True)
         
-        # 4. 【核心】干掉带有 10mM, μL, DMSO 的垃圾注释行
-        # 标准孔位是 A01, B02 这种格式，正则匹配 ^[A-Za-z]\d{1,2}$
         if 'Well' in df.columns:
-            valid_well_mask = df['Well'].fillna("").astype(str).str.strip().str.match(r'^[a-zA-Z]\d{1,2}$')
+            # 先用白名单清洗一遍所有孔位
+            df['Well'] = df['Well'].apply(lambda x: re.sub(r'[^a-zA-Z0-9]', '', str(x)))
+            # 过滤垃圾行：只保留 A01, B2 这种格式的行
+            valid_well_mask = df['Well'].str.match(r'^[A-Za-z]\d{1,2}$')
             df = df[valid_well_mask].copy()
             
-        # 5. 【核心】把 MCE 的乱码板号映射为 1, 2, 3...
         if 'Plate' in df.columns:
             unique_plates = df['Plate'].dropna().unique()
-            # 过滤空字符串
-            unique_plates = [p for p in unique_plates if p.strip() != '']
-            # 建立映射字典：第一个出现的板=1，第二个=2...
+            unique_plates = [p for p in unique_plates if str(p).strip() != '']
             plate_mapping = {p: str(i+1) for i, p in enumerate(unique_plates)}
             df['Physical_Plate'] = df['Plate'].map(plate_mapping)
             
@@ -135,7 +135,7 @@ if uploaded_file is not None:
         total_tox_drop = 0
         total_high_drop = 0
         global_drug_count = 0
-        plate_count = 1  # 记录物理板数
+        plate_count = 1  
         
         progress_bar = st.progress(0)
         
@@ -146,15 +146,12 @@ if uploaded_file is not None:
         while i < len(df):
             val = str(df.iloc[i, COL_IDX_PLATE_ID]).strip()
             
-            # 如果 A 列有内容，且不是 nan，说明找到了一块新板
             if val and val.lower() != 'nan':
-                # 检查剩下的行数够不够一整板 (默认 8 行)
                 if i + int(PLATE_HEIGHT) <= len(df):
                     plate_df = df.iloc[i : i + int(PLATE_HEIGHT), :].reset_index(drop=True)
                     plate_id = val
-                    physical_plate = str(plate_count) # 强制赋予物理序号 1, 2, 3...
+                    physical_plate = str(plate_count) 
                     
-                    # --- 计算内参和毒性 ---
                     try:
                         curr_ctrls = plate_df.iloc[ROWS_CONTROL_RELATIVE, COL_IDX_CONTROL].values
                         plate_ctrl_mean = calculate_clean_mean(curr_ctrls)
@@ -165,7 +162,6 @@ if uploaded_file is not None:
                         plate_ctrl_mean = 0
                         
                     if plate_ctrl_mean > 0:
-                        # --- 处理药物孔 ---
                         drug_block = plate_df.iloc[:, COLS_IDX_DRUG]
                         for (rel_r, abs_c), cell_val in drug_block.stack().items():
                             global_drug_count += 1
@@ -176,7 +172,6 @@ if uploaded_file is not None:
                                 
                             if np.isnan(cell_val): continue
 
-                            # 判定假阳性和超高信号
                             if cell_val < plate_tox_threshold:
                                 total_tox_drop += 1
                                 continue
@@ -187,7 +182,6 @@ if uploaded_file is not None:
                             ratio = cell_val / plate_ctrl_mean
                             is_hit = "Yes" if ratio >= THRESHOLD_HIT else "No"
                             
-                            # 计算坐标
                             excel_row_num = i + rel_r + 1
                             excel_col_char = get_col_letter(abs_c)
                             
@@ -196,9 +190,9 @@ if uploaded_file is not None:
                             
                             all_results.append({
                                 "Global_ID": global_drug_count,
-                                "Plate_ID": plate_id,            # 原始名称，比如 1#-F
-                                "Physical_Plate": physical_plate, # 物理板号，比如 1
-                                "Physical_Well": physical_well,  # 物理孔位，比如 A02
+                                "Plate_ID": plate_id,            
+                                "Physical_Plate": physical_plate, 
+                                "Physical_Well": physical_well,  
                                 "Coordinate": f"{excel_col_char}{excel_row_num}",
                                 "Ratio": ratio,
                                 "Raw_RFU": cell_val,
@@ -206,12 +200,12 @@ if uploaded_file is not None:
                             })
                     
                     plate_count += 1
-                    i += int(PLATE_HEIGHT) # 跳过这 8 行
+                    i += int(PLATE_HEIGHT) 
                     progress_bar.progress(min(i / len(df), 1.0))
                 else:
-                    break # 剩余行数不够一板，退出
+                    break 
             else:
-                i += 1 # 如果是空行，继续往下找
+                i += 1 
 
         progress_bar.progress(1.0)
 
@@ -222,21 +216,20 @@ if uploaded_file is not None:
             df_res = pd.DataFrame(all_results)
             
             if uploaded_lib is not None:
-                st.info("🔄 正在智能解析 MCE Excel 化合物库...")
+                st.info("🔄 正在智能解析 MCE Excel 化合物库 (终极净网模式)...")
                 df_lib = load_mce_library(uploaded_lib, uploaded_lib.name)
                 
                 if df_lib is not None:
                     if "Physical_Plate" not in df_lib.columns or "Physical_Well" not in df_lib.columns:
                         st.warning("⚠️ Excel 格式不匹配，未能生成对照列。")
                     else:
-                        # 强制转换为字符串后进行完美合并
                         df_res['Physical_Plate'] = df_res['Physical_Plate'].astype(str)
                         df_res['Physical_Well'] = df_res['Physical_Well'].astype(str)
                         df_lib['Physical_Plate'] = df_lib['Physical_Plate'].astype(str)
                         df_lib['Physical_Well'] = df_lib['Physical_Well'].astype(str)
                         
                         df_res = pd.merge(df_res, df_lib, on=["Physical_Plate", "Physical_Well"], how="left")
-                        st.success("✅ 化合物名称已成功接入！")
+                        st.success("✅ 净化完成！化合物名称已完美接入！")
 
             # --------------------------
             # 展示与绘图
@@ -272,7 +265,6 @@ if uploaded_file is not None:
             st.subheader("🎉 强效升高信号药 (Hits) 列表")
             
             if not hits_df.empty:
-                # 定制展示列：把 MCE 的关键信息排在最前
                 base_cols = ["Plate_ID", "Physical_Well", "Ratio", "Raw_RFU"] 
                 lib_cols = [c for c in ["Product Name", "Catalog Number", "Target", "Pathway"] if c in df_res.columns]
                 display_cols = lib_cols + base_cols
