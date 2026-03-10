@@ -15,7 +15,7 @@ st.markdown("""
 此工具用于自动化分析药物筛选数据，**寻找引起信号升高的化合物**。
 - **支持多板分析**：自动识别板号。
 - **智能清洗**：自动剔除内参异常值和毒性假阳性。
-- **化合物库映射**：上传 MCE 等化合物库表格，自动将孔位坐标翻译为具体的药物名称。
+- **化合物库映射**：支持 MCE 的各种刁钻格式 (CSV/TSV/Excel)，自动匹配药物名！
 """)
 
 # 侧边栏：参数配置
@@ -53,7 +53,7 @@ def get_col_letter(col_idx):
     return f"C{col_idx}"
 
 def format_well(w):
-    """ 暴力清洗孔位名称，去除所有制表符、空格和隐藏字符 """
+    """ 彻底清洗孔位：删掉空格、Tab、换行符 """
     w = str(w)
     w = re.sub(r'[\s\t\n\r\ufeff]+', '', w)
     if len(w) >= 2 and w[0].isalpha() and w[1:].isdigit():
@@ -61,43 +61,61 @@ def format_well(w):
     return w
 
 def load_mce_library(file_obj, filename):
-    """ 超级健壮的化合物库读取器 """
+    """ 超级健壮的化合物库读取器（自动探测逗号或Tab） """
     try:
-        # 使用 utf-8-sig 可以自动处理恼人的 BOM 隐藏字符
         if filename.endswith('.csv'):
+            # 1. 强行读取文件内容为字符串
+            file_obj.seek(0)
+            raw_bytes = file_obj.read()
             try:
-                df = pd.read_csv(file_obj, encoding='utf-8-sig')
-            except:
-                file_obj.seek(0)
-                df = pd.read_csv(file_obj, encoding='gbk')
-        else:
-            df = pd.read_excel(file_obj)
+                text = raw_bytes.decode('utf-8-sig') # 自动去除UTF-8 BOM
+            except UnicodeDecodeError:
+                text = raw_bytes.decode('gbk')
             
-        # 如果第一行不是表头，向下寻找带有 plate 的那一行作为表头
-        cols_str = " ".join(df.columns.astype(str)).lower()
-        if "plate" not in cols_str:
-            header_idx = -1
-            for i, row in df.head(20).iterrows():
-                row_str = " ".join(row.astype(str).fillna("")).lower()
-                if "plate" in row_str and "well" in row_str:
+            lines = text.splitlines()
+            header_idx = 0
+            sep = ',' # 默认用逗号
+            
+            # 2. 扫描前30行找表头，并智能判断分隔符
+            for i, line in enumerate(lines[:30]):
+                line_lower = line.lower()
+                if 'plate' in line_lower and ('well' in line_lower or 'product' in line_lower or 'catalog' in line_lower):
                     header_idx = i
+                    # 如果这行里有 \t，说明它其实是 TSV
+                    if '\t' in line:
+                        sep = '\t'
                     break
-            if header_idx != -1:
-                df.columns = df.iloc[header_idx]
-                df = df.iloc[header_idx+1:].reset_index(drop=True)
+            
+            # 3. 使用找到的分隔符去解析字符串
+            df = pd.read_csv(io.StringIO(text), skiprows=header_idx, sep=sep, engine='python')
+            
+        else:
+            # Excel 处理逻辑
+            df = pd.read_excel(file_obj)
+            cols_str = " ".join(df.columns.astype(str)).lower()
+            if "plate" not in cols_str:
+                header_idx = -1
+                for i, row in df.head(30).iterrows():
+                    row_str = " ".join(row.astype(str).fillna("")).lower()
+                    if "plate" in row_str and ("well" in row_str or "product" in row_str):
+                        header_idx = i
+                        break
+                if header_idx != -1:
+                    df.columns = df.iloc[header_idx]
+                    df = df.iloc[header_idx+1:].reset_index(drop=True)
 
-        # 清洗列名，去掉隐藏符号
+        # 4. 标准化列名，彻底清理那些看不见的牛鬼蛇神符号
         df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '')
         
-        # 智能标准化列名（防止叫 Plate_Num 等名字）
         col_map = {}
         for c in df.columns:
-            cl = c.lower()
-            if 'plate' in cl: col_map[c] = 'Plate'
-            elif 'well' in cl or 'position' in cl: col_map[c] = 'Well'
+            cl = c.lower().strip()
+            if cl in ['plate', 'plate number', 'platenum']: col_map[c] = 'Plate'
+            elif cl in ['well', 'position', 'well position']: col_map[c] = 'Well'
             elif 'product name' in cl or 'compound name' in cl or cl == 'name': col_map[c] = 'Product Name'
-            elif 'catalog' in cl or 'item' in cl: col_map[c] = 'Catalog Number'
+            elif 'catalog number' in cl or 'catalog' in cl or 'item' in cl: col_map[c] = 'Catalog Number'
             elif 'target' in cl: col_map[c] = 'Target'
+            elif 'pathway' in cl: col_map[c] = 'Pathway'
         
         df.rename(columns=col_map, inplace=True)
         return df
@@ -199,14 +217,11 @@ if uploaded_file is not None:
                 df_lib = load_mce_library(uploaded_lib, uploaded_lib.name)
                 
                 if df_lib is not None:
-                    # 如果还是没找到，打印出真实读到的表头，方便诊断
                     if "Plate" not in df_lib.columns or "Well" not in df_lib.columns:
-                        st.warning("⚠️ 在化合物库中找不到 Plate 或 Well 列。")
-                        with st.expander("点击查看程序读取到的真实表头 (供查错)"):
-                            st.write(df_lib.columns.tolist())
-                            st.write(df_lib.head(3))
+                        st.warning("⚠️ 格式解析异常，找不到标准列名。已提取的列名如下：")
+                        st.write(df_lib.columns.tolist())
                     else:
-                        # 安全提取并合并
+                        # 确保 Plate 和 Well 格式统一
                         df_lib["Physical_Plate"] = df_lib["Plate"].astype(str).str.extract(r'(\d+)')[0]
                         df_lib["Physical_Well"] = df_lib["Well"].apply(format_well)
                         
@@ -244,7 +259,7 @@ if uploaded_file is not None:
             st.subheader("🎉 强效升高信号药 (Hits) 列表")
             
             if not hits_df.empty:
-                # 重新组织显示的列，把化合物名称放在最前面，去掉Coordinate
+                # 重新组织显示的列，把化合物名称放在最前面
                 base_cols = ["Plate_ID", "Physical_Well", "Ratio", "Raw_RFU"] 
                 lib_cols = [c for c in ["Product Name", "Catalog Number", "Target", "Pathway"] if c in df_res.columns]
                 display_cols = lib_cols + base_cols
