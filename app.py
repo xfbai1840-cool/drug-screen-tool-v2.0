@@ -53,7 +53,7 @@ def get_col_letter(col_idx):
     return f"C{col_idx}"
 
 def format_well(w):
-    """ 彻底清洗孔位：删掉空格、Tab、换行符 """
+    """ 暴力清洗孔位：删掉空格、Tab、换行符 """
     w = str(w)
     w = re.sub(r'[\s\t\n\r\ufeff]+', '', w)
     if len(w) >= 2 and w[0].isalpha() and w[1:].isdigit():
@@ -61,34 +61,42 @@ def format_well(w):
     return w
 
 def load_mce_library(file_obj, filename):
-    """ 超级健壮的化合物库读取器（自动探测逗号或Tab） """
+    """ 超级健壮的化合物库读取器（带多层容错） """
     try:
-        if filename.endswith('.csv'):
-            # 1. 强行读取文件内容为字符串
-            file_obj.seek(0)
-            raw_bytes = file_obj.read()
+        raw_bytes = file_obj.getvalue()
+        if filename.lower().endswith('.csv'):
             try:
-                text = raw_bytes.decode('utf-8-sig') # 自动去除UTF-8 BOM
+                text = raw_bytes.decode('utf-8-sig') # 强力去除 BOM 头
             except UnicodeDecodeError:
-                text = raw_bytes.decode('gbk')
+                text = raw_bytes.decode('gbk', errors='ignore')
             
+            if not text.strip():
+                st.warning("上传的化合物库文件似乎是空的。")
+                return None
+                
             lines = text.splitlines()
             header_idx = 0
-            sep = ',' # 默认用逗号
+            sep = ','
             
-            # 2. 扫描前30行找表头，并智能判断分隔符
             for i, line in enumerate(lines[:30]):
                 line_lower = line.lower()
                 if 'plate' in line_lower and ('well' in line_lower or 'product' in line_lower or 'catalog' in line_lower):
                     header_idx = i
-                    # 如果这行里有 \t，说明它其实是 TSV
                     if '\t' in line:
                         sep = '\t'
                     break
             
-            # 3. 使用找到的分隔符去解析字符串
-            df = pd.read_csv(io.StringIO(text), skiprows=header_idx, sep=sep, engine='python')
-            
+            try:
+                # 第一层尝试：使用 C 引擎和精准定位读取
+                df = pd.read_csv(io.StringIO(text), skiprows=header_idx, sep=sep)
+            except Exception:
+                try:
+                    # 第二层降级：让 pandas 全自动猜测分隔符
+                    file_obj.seek(0)
+                    df = pd.read_csv(file_obj, sep=None, engine='python')
+                except Exception as e:
+                    st.error(f"无法解析该文件格式: {e}")
+                    return None
         else:
             # Excel 处理逻辑
             df = pd.read_excel(file_obj)
@@ -104,13 +112,16 @@ def load_mce_library(file_obj, filename):
                     df.columns = df.iloc[header_idx]
                     df = df.iloc[header_idx+1:].reset_index(drop=True)
 
-        # 4. 标准化列名，彻底清理那些看不见的牛鬼蛇神符号
+        if df is None or df.empty:
+            return None
+
+        # 暴力洗刷列名中的全部隐藏字符
         df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '')
         
         col_map = {}
         for c in df.columns:
             cl = c.lower().strip()
-            if cl in ['plate', 'plate number', 'platenum']: col_map[c] = 'Plate'
+            if cl in ['plate', 'plate number', 'platenum', 'plate_id']: col_map[c] = 'Plate'
             elif cl in ['well', 'position', 'well position']: col_map[c] = 'Well'
             elif 'product name' in cl or 'compound name' in cl or cl == 'name': col_map[c] = 'Product Name'
             elif 'catalog number' in cl or 'catalog' in cl or 'item' in cl: col_map[c] = 'Catalog Number'
@@ -120,7 +131,7 @@ def load_mce_library(file_obj, filename):
         df.rename(columns=col_map, inplace=True)
         return df
     except Exception as e:
-        st.error(f"解析化合物库失败: {e}")
+        st.error(f"读取化合物库时发生内部错误: {e}")
         return None
 
 # ==========================================
@@ -213,20 +224,20 @@ if uploaded_file is not None:
             df_res = pd.DataFrame(all_results)
             
             if uploaded_lib is not None:
-                st.info("🔄 正在智能解析化合物库...")
+                st.info("🔄 正在智能解析化合物库 (采用深度清洁模式)...")
                 df_lib = load_mce_library(uploaded_lib, uploaded_lib.name)
                 
                 if df_lib is not None:
                     if "Plate" not in df_lib.columns or "Well" not in df_lib.columns:
-                        st.warning("⚠️ 格式解析异常，找不到标准列名。已提取的列名如下：")
+                        st.warning("⚠️ 格式解析异常，未能自动匹配列名。已提取的列名如下：")
                         st.write(df_lib.columns.tolist())
                     else:
-                        # 确保 Plate 和 Well 格式统一
+                        # 确保 Plate 提取数字并一致化，同时清洗 Well 孔位里的 \t 等乱码
                         df_lib["Physical_Plate"] = df_lib["Plate"].astype(str).str.extract(r'(\d+)')[0]
                         df_lib["Physical_Well"] = df_lib["Well"].apply(format_well)
                         
                         df_res = pd.merge(df_res, df_lib, on=["Physical_Plate", "Physical_Well"], how="left")
-                        st.success("✅ 化合物名称匹配成功！")
+                        st.success("✅ 化合物名称已成功接入！")
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("总扫描孔数", global_drug_count)
@@ -259,7 +270,6 @@ if uploaded_file is not None:
             st.subheader("🎉 强效升高信号药 (Hits) 列表")
             
             if not hits_df.empty:
-                # 重新组织显示的列，把化合物名称放在最前面
                 base_cols = ["Plate_ID", "Physical_Well", "Ratio", "Raw_RFU"] 
                 lib_cols = [c for c in ["Product Name", "Catalog Number", "Target", "Pathway"] if c in df_res.columns]
                 display_cols = lib_cols + base_cols
@@ -275,7 +285,7 @@ if uploaded_file is not None:
                     hits_display[export_cols].to_excel(writer, index=False, sheet_name='Hits')
                 
                 st.download_button(
-                    label="📥 下载详细 Hits 列表 (Excel)",
+                    label="📥 下载带有化合物详细信息的 Hits (Excel)",
                     data=buffer.getvalue(),
                     file_name="Enhancer_Hits_with_Info.xlsx",
                     mime="application/vnd.ms-excel"
@@ -287,4 +297,4 @@ if uploaded_file is not None:
             st.error("分析完成，但没有有效数据（可能全部被剔除或格式错误）。")
             
     except Exception as e:
-        st.error(f"文件读取或分析出错: {e}")
+        st.error(f"分析筛选数据时出错: {e}")
