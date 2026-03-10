@@ -60,8 +60,10 @@ def get_col_letter(col_idx):
     return f"C{col_idx}"
 
 def format_well(w):
-    """ 将孔位标准化，例如 A2 -> A02 """
-    w = str(w).strip()
+    """ 将孔位标准化，例如 A2 -> A02，并暴力清除所有隐藏符号(如 \t) """
+    w = str(w)
+    # 用正则把所有的空格、制表符(\t)、回车(\n\r)全部删掉
+    w = re.sub(r'[\s\t\n\r]+', '', w)
     if len(w) >= 2 and w[0].isalpha() and w[1:].isdigit():
         return f"{w[0].upper()}{int(w[1:]):02d}"
     return w
@@ -69,7 +71,6 @@ def format_well(w):
 def load_mce_library(file_obj, filename):
     """ 智能读取 MCE 化合物库（自动跳过前几行的介绍文字） """
     try:
-        # 先读取前30行寻找表头
         if filename.endswith('.csv'):
             try:
                 raw_df = pd.read_csv(file_obj, header=None, nrows=30, encoding='utf-8')
@@ -82,7 +83,6 @@ def load_mce_library(file_obj, filename):
         header_idx = 0
         for i, row in raw_df.iterrows():
             row_str = " ".join(row.astype(str).fillna("").values).lower()
-            # MCE表头通常包含 plate 和 product name 
             if "plate" in row_str and ("well" in row_str or "product name" in row_str):
                 header_idx = i
                 break
@@ -96,6 +96,9 @@ def load_mce_library(file_obj, filename):
                 df = pd.read_csv(file_obj, skiprows=header_idx, encoding='gbk')
         else:
             df = pd.read_excel(file_obj, skiprows=header_idx)
+            
+        # 清洗表头，防止表头也带有隐藏空格
+        df.columns = [str(c).strip() for c in df.columns]
         return df
     except Exception as e:
         st.error(f"解析化合物库失败: {e}")
@@ -108,7 +111,7 @@ col_upload1, col_upload2 = st.columns(2)
 with col_upload1:
     uploaded_file = st.file_uploader("1️⃣ 必填：请上传 CSV 筛选数据文件", type=["csv"])
 with col_upload2:
-    uploaded_lib = st.file_uploader("2️⃣ 可选：请上传 MCE 化合物信息库", type=["csv", "xlsx"], help="例如：MCE Library-Detailed Information...xlsx")
+    uploaded_lib = st.file_uploader("2️⃣ 可选：请上传 MCE 化合物信息库", type=["csv", "xlsx"])
 
 if uploaded_file is not None:
     try:
@@ -119,7 +122,6 @@ if uploaded_file is not None:
         total_high_drop = 0
         global_drug_count = 0
         
-        # 进度条
         progress_bar = st.progress(0)
         total_steps = len(range(0, len(df), PLATE_STEP))
         current_step = 0
@@ -133,16 +135,13 @@ if uploaded_file is not None:
             
             plate_df = df.iloc[start_row:end_row, :]
             
-            # 获取板号
             plate_id = str(plate_df.iloc[0, COL_IDX_PLATE_ID])
             if plate_id == 'nan' or plate_id.strip() == '':
                 plate_id = f"Plate_{start_row // PLATE_STEP + 1}"
                 
-            # 提取纯数字板号 (例如 "Plate_1" -> "1")
             num_match = re.search(r'\d+', plate_id)
             physical_plate = num_match.group(0) if num_match else str(start_row // PLATE_STEP + 1)
 
-            # 计算内参和毒性
             try:
                 curr_ctrls = plate_df.iloc[ROWS_CONTROL_RELATIVE, COL_IDX_CONTROL].values
                 plate_ctrl_mean = calculate_clean_mean(curr_ctrls)
@@ -153,7 +152,6 @@ if uploaded_file is not None:
             except:
                 continue
 
-            # 处理药物孔
             drug_block = plate_df.iloc[:, COLS_IDX_DRUG]
             
             for (rel_r, abs_c), val in drug_block.stack().items():
@@ -172,12 +170,9 @@ if uploaded_file is not None:
                 ratio = val / plate_ctrl_mean
                 is_hit = "Yes" if ratio >= THRESHOLD_HIT else "No"
                 
-                # Excel 相对坐标 (如 C5)
                 excel_row_num = start_row + rel_r + 1
                 excel_col_char = get_col_letter(abs_c)
                 
-                # 96孔板物理坐标 (如 A02)
-                # rel_r: 0->A, 1->B. abs_c: 2->Col 2 (标准MCE排列: 1是空白/内参, 2-11是药)
                 plate_row_char = chr(65 + rel_r)
                 physical_well = f"{plate_row_char}{abs_c:02d}"
                 
@@ -199,25 +194,22 @@ if uploaded_file is not None:
             df_res = pd.DataFrame(all_results)
             
             if uploaded_lib is not None:
-                st.info("🔄 正在解析并匹配化合物库信息...")
+                st.info("🔄 正在解析并匹配化合物库信息 (正在清理隐藏字符)...")
                 df_lib = load_mce_library(uploaded_lib, uploaded_lib.name)
                 
-                # 使用括号安全换行，防止再次出现 SyntaxError
                 if (df_lib is not None and 
                     "Plate" in df_lib.columns and 
                     "Well" in df_lib.columns):
                     
-                    # 标准化 MCE 的板号和孔位
+                    # 提取板号，并使用更新过的 format_well 函数清理孔位中的 \t 等奇怪符号
                     df_lib["Physical_Plate"] = df_lib["Plate"].astype(str).str.extract(r'(\d+)')[0]
                     df_lib["Physical_Well"] = df_lib["Well"].apply(format_well)
                     
-                    # 进行合并
                     df_res = pd.merge(df_res, df_lib, on=["Physical_Plate", "Physical_Well"], how="left")
                     st.success("✅ 化合物库匹配成功！化合物名称已添加到结果中。")
                 else:
                     st.warning("⚠️ 无法在上传的库文件中自动识别 'Plate' 和 'Well' 列，请检查文件格式。")
 
-            # 1. 统计信息
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("总扫描孔数", global_drug_count)
             col2.metric("毒性/假阳性剔除", total_tox_drop)
@@ -226,7 +218,6 @@ if uploaded_file is not None:
             
             st.divider()
             
-            # 2. 绘图
             st.subheader("📊 筛选结果可视化")
             fig, ax = plt.subplots(figsize=(12, 6))
             ax.scatter(df_res["Global_ID"], df_res["Ratio"], c='#5cb85c', s=15, alpha=0.6, label='Candidates')
@@ -246,28 +237,28 @@ if uploaded_file is not None:
             ax.grid(True, linestyle=':', alpha=0.4)
             st.pyplot(fig)
             
-            # 3. Hits 下载
             st.divider()
             st.subheader("🎉 强效升高信号药 (Hits) 列表")
             
             if not hits_df.empty:
                 st.write(f"发现 **{len(hits_df)}** 个 Hits (Ratio ≥ {THRESHOLD_HIT})")
                 
-                # 动态选择要展示的列（如果有上传化合物库，把关键信息排在前面）
-                base_cols = ["Plate_ID", "Physical_Well", "Ratio", "Raw_RFU", "Coordinate"]
+                # 【修改点】去掉 Coordinate，把化合物名称提上来
+                base_cols = ["Plate_ID", "Physical_Well", "Ratio", "Raw_RFU"] 
                 lib_cols = [c for c in ["Product Name", "Catalog Number", "Target", "Pathway"] if c in df_res.columns]
+                
+                # 合并要展示的列（化合物信息优先）
                 display_cols = lib_cols + base_cols
                 
-                # 按照 Ratio 降序排列
                 hits_display = hits_df.sort_values(by="Ratio", ascending=False)
                 final_cols = [c for c in display_cols if c in hits_display.columns]
                 
-                st.dataframe(hits_display[final_cols].head(10))
+                # 在页面上展示表格
+                st.dataframe(hits_display[final_cols].head(15))
                 
-                # 导出Excel，包含所有详细信息
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                    # 导出全部字段以防万一
+                    # 导出时，除了核心列，剩下的其他次要信息也一并导出放后面备查
                     export_cols = final_cols + [c for c in hits_display.columns if c not in final_cols and c not in ["Physical_Plate", "Is_Hit"]]
                     hits_display[export_cols].to_excel(writer, index=False, sheet_name='Hits')
                 
